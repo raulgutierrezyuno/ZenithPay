@@ -138,9 +138,30 @@ src/
 
 ## Anomaly Detection Algorithms
 
-1. **Underperforming Payment Methods**: Flags methods with approval rate >12% below global average
-2. **Processor Anomalies**: Compares all processors, identifies best/worst with gap analysis
-3. **High-Impact Decline Reasons**: Identifies reasons costing >3% of total revenue
-4. **Geographic Outliers**: Countries with approval rate >8% below average
-5. **Recoverable Revenue**: Quantifies soft decline revenue that could be recovered
-6. **Temporal Anomalies**: Hours with approval rates significantly below daily average
+All detection algorithms use **z-score statistical analysis** instead of hardcoded thresholds. The z-score measures how many standard deviations a value is from the mean, making detection adaptive to data distribution.
+
+| Algorithm | Statistical Method | Threshold |
+|-----------|-------------------|-----------|
+| **Underperforming Payment Methods** | z-score of approval rate across methods | z < -1.5σ (warning), z < -2σ (critical) |
+| **Processor Anomalies** | z-score of approval rate across processors | z < -1.5σ (worst), z < -1σ (secondary) |
+| **High-Impact Decline Reasons** | z-score of revenue impact across reasons | z > +1σ (warning), z > +2σ (critical) |
+| **Geographic Outliers** | z-score of approval rate across countries | z < -1.5σ (warning), z < -2σ (critical) |
+| **Recoverable Revenue** | Absolute revenue calculation | Soft decline revenue > $1,000 |
+| **Temporal Anomalies** | z-score of hourly approval rates (2-sigma rule) | z < -2σ |
+
+## Design Decisions
+
+### Why Next.js (single project, no separate backend)?
+A single `npm run dev` command starts the entire application. API routes handle data processing server-side, while React components render the dashboard client-side. This eliminates the need for a separate Python/Flask backend, reducing setup complexity for reviewers from multiple services to one command.
+
+### Why in-memory data with seeded PRNG instead of a database?
+The deterministic generator (`seed=42`) produces identical data on every run, making analysis reproducible and eliminating database setup. For 5,500 transactions, in-memory processing is faster than any database query. The seeded PRNG ensures reviewers see the exact same patterns and metrics.
+
+### Why custom SVG charts instead of a charting library (Recharts, Chart.js)?
+Custom SVG gives full control over the visual design without adding 200KB+ of dependencies. Each chart is a self-contained React component with `useMemo` for performance. This also avoids peer dependency conflicts (Tremor/Recharts had conflicts with React 19).
+
+### Why z-score for anomaly detection instead of fixed thresholds?
+Fixed thresholds (e.g., ">12% below average") don't adapt to data distribution. Z-scores dynamically calculate what's "anomalous" based on the actual spread of values. A payment method 15% below average might not be anomalous if all methods vary widely, but 8% below might be significant if variance is low. The -1.5σ and -2σ thresholds follow standard statistical practice for outlier detection.
+
+### Why prioritize insights by financial impact, not just percentage?
+A 30% decline in a method processing 50 transactions/month matters less than a 10% decline in one processing 5,000. All insights include USD-denominated `impact` values, and sorting uses severity first, then financial impact, ensuring the most business-critical issues surface first.

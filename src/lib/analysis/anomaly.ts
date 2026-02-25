@@ -1,4 +1,4 @@
-import { Transaction, Insight, DimensionMetric } from '../data/schema';
+import { Transaction, Insight } from '../data/schema';
 import { calculateKPIs, aggregateByDimension, getTopDeclineReasons, getHourlyPattern, getRecoverableBreakdown } from './metrics';
 
 let insightCounter = 0;
@@ -6,20 +6,41 @@ function nextId(): string {
   return `insight_${++insightCounter}`;
 }
 
+/** Compute standard deviation for an array of numbers */
+function stdDev(values: number[]): number {
+  const n = values.length;
+  if (n < 2) return 0;
+  const mean = values.reduce((s, v) => s + v, 0) / n;
+  const variance = values.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / n;
+  return Math.sqrt(variance);
+}
+
+/** Compute z-score: how many standard deviations a value is from the mean */
+function zScore(value: number, mean: number, sd: number): number {
+  if (sd === 0) return 0;
+  return (value - mean) / sd;
+}
+
 export function detectUnderperformingMethods(transactions: Transaction[], globalApprovalRate: number): Insight[] {
   const byMethod = aggregateByDimension(transactions, 'paymentMethod');
   const insights: Insight[] = [];
 
+  const rates = byMethod.map(m => m.approvalRate);
+  const mean = rates.reduce((s, v) => s + v, 0) / rates.length;
+  const sd = stdDev(rates);
+
   for (const m of byMethod) {
-    const diff = globalApprovalRate - m.approvalRate;
-    if (diff > 12 && m.total > 50) {
-      const severity = diff > 20 ? 'critical' : 'warning';
+    const z = zScore(m.approvalRate, mean, sd);
+    // Flag methods below -1.5 sigma (statistically significant underperformance)
+    if (z < -1.5 && m.total > 50) {
+      const diff = globalApprovalRate - m.approvalRate;
+      const severity = z < -2 ? 'critical' : 'warning';
       insights.push({
         id: nextId(),
         type: 'underperforming_method',
         severity,
-        title: `${m.value.toUpperCase()} has ${m.approvalRate.toFixed(1)}% approval rate`,
-        description: `${m.value} payments have an approval rate ${diff.toFixed(1)}% below the global average of ${globalApprovalRate.toFixed(1)}%. This affects ${m.declined} transactions with $${Math.round(m.lostRevenue).toLocaleString()} in lost revenue.`,
+        title: `${m.value.toUpperCase()} has ${m.approvalRate.toFixed(1)}% approval rate (z=${z.toFixed(2)})`,
+        description: `${m.value} payments have an approval rate ${diff.toFixed(1)}% below the global average of ${globalApprovalRate.toFixed(1)}% (z-score: ${z.toFixed(2)}, threshold: -1.5σ). This affects ${m.declined} transactions with $${Math.round(m.lostRevenue).toLocaleString()} in lost revenue.`,
         impact: m.lostRevenue,
         recommendation: `Investigate ${m.value} decline reasons and consider implementing retry logic or offering alternative payment methods to affected customers.`,
       });
@@ -33,36 +54,43 @@ export function detectProcessorAnomalies(transactions: Transaction[], globalAppr
   const byProcessor = aggregateByDimension(transactions, 'processor');
   const insights: Insight[] = [];
 
+  if (byProcessor.length < 2) return [];
+
+  const rates = byProcessor.map(p => p.approvalRate);
+  const mean = rates.reduce((s, v) => s + v, 0) / rates.length;
+  const sd = stdDev(rates);
+
   // Find best and worst processor
   const sorted = [...byProcessor].sort((a, b) => a.approvalRate - b.approvalRate);
-  if (sorted.length < 2) return [];
-
   const worst = sorted[0];
   const best = sorted[sorted.length - 1];
   const diff = best.approvalRate - worst.approvalRate;
+  const worstZ = zScore(worst.approvalRate, mean, sd);
 
-  if (diff > 10 && worst.total > 100) {
+  // Flag worst processor if statistically significant (below -1.5σ)
+  if (worstZ < -1.5 && worst.total > 100) {
     insights.push({
       id: nextId(),
       type: 'processor_anomaly',
-      severity: diff > 20 ? 'critical' : 'warning',
-      title: `${worst.value} underperforms by ${diff.toFixed(1)}% vs ${best.value}`,
-      description: `${worst.value} has ${worst.approvalRate.toFixed(1)}% approval rate compared to ${best.value}'s ${best.approvalRate.toFixed(1)}%. Routing traffic away from ${worst.value} could recover significant revenue.`,
+      severity: worstZ < -2 ? 'critical' : 'warning',
+      title: `${worst.value} underperforms by ${diff.toFixed(1)}% vs ${best.value} (z=${worstZ.toFixed(2)})`,
+      description: `${worst.value} has ${worst.approvalRate.toFixed(1)}% approval rate compared to ${best.value}'s ${best.approvalRate.toFixed(1)}% (z-score: ${worstZ.toFixed(2)}). Routing traffic away from ${worst.value} could recover significant revenue.`,
       impact: worst.lostRevenue * (diff / 100),
       recommendation: `Consider routing ${worst.value} traffic to ${best.value} where possible. Estimated monthly impact: $${Math.round(worst.lostRevenue * (diff / 100)).toLocaleString()}/month.`,
     });
   }
 
-  // Check each processor below average
+  // Check each processor below -1σ (excluding already-flagged worst)
   for (const p of byProcessor) {
-    const pDiff = globalApprovalRate - p.approvalRate;
-    if (pDiff > 8 && p.total > 100 && p.value !== worst.value) {
+    const pZ = zScore(p.approvalRate, mean, sd);
+    if (pZ < -1 && p.total > 100 && p.value !== worst.value) {
+      const pDiff = globalApprovalRate - p.approvalRate;
       insights.push({
         id: nextId(),
         type: 'processor_anomaly',
         severity: 'warning',
-        title: `${p.value} approval rate is ${pDiff.toFixed(1)}% below average`,
-        description: `${p.value} processes ${p.total} transactions at ${p.approvalRate.toFixed(1)}% approval rate, which is ${pDiff.toFixed(1)}% below the global average.`,
+        title: `${p.value} approval rate is ${pDiff.toFixed(1)}% below average (z=${pZ.toFixed(2)})`,
+        description: `${p.value} processes ${p.total} transactions at ${p.approvalRate.toFixed(1)}% approval rate (z-score: ${pZ.toFixed(2)}, below -1σ threshold).`,
         impact: p.lostRevenue * (pDiff / 100),
         recommendation: `Review ${p.value} configuration and consider A/B testing traffic splits with alternative processors.`,
       });
@@ -78,15 +106,21 @@ export function detectHighImpactReasons(transactions: Transaction[]): Insight[] 
   const reasons = getTopDeclineReasons(transactions);
   const insights: Insight[] = [];
 
+  const impacts = reasons.map(r => r.revenueImpact);
+  const meanImpact = impacts.reduce((s, v) => s + v, 0) / impacts.length;
+  const sdImpact = stdDev(impacts);
+
   for (const r of reasons) {
     const revenuePercent = (r.revenueImpact / totalRevenue) * 100;
-    if (revenuePercent > 3) {
+    const z = zScore(r.revenueImpact, meanImpact, sdImpact);
+    // Flag reasons with revenue impact above +1σ (high-impact outliers)
+    if (z > 1 && revenuePercent > 2) {
       insights.push({
         id: nextId(),
         type: 'high_impact_reason',
-        severity: revenuePercent > 7 ? 'critical' : 'warning',
-        title: `"${r.label}" costs $${Math.round(r.revenueImpact).toLocaleString()} (${revenuePercent.toFixed(1)}% of total revenue)`,
-        description: `${r.count} transactions declined due to "${r.label}" (${r.category.replace('_', ' ')}). This is ${r.isRecoverable ? 'potentially recoverable' : 'non-recoverable'}.`,
+        severity: z > 2 ? 'critical' : 'warning',
+        title: `"${r.label}" costs $${Math.round(r.revenueImpact).toLocaleString()} (${revenuePercent.toFixed(1)}% of revenue, z=${z.toFixed(2)})`,
+        description: `${r.count} transactions declined due to "${r.label}" (${r.category.replace('_', ' ')}). Revenue impact is ${z.toFixed(1)} standard deviations above the mean decline reason impact. This is ${r.isRecoverable ? 'potentially recoverable' : 'non-recoverable'}.`,
         impact: r.revenueImpact,
         recommendation: r.isRecoverable
           ? `Implement retry logic for "${r.label}" declines. Consider sending customer notifications to retry with alternative payment methods.`
@@ -102,15 +136,21 @@ export function detectGeographicOutliers(transactions: Transaction[], globalAppr
   const byCountry = aggregateByDimension(transactions, 'country');
   const insights: Insight[] = [];
 
+  const rates = byCountry.map(c => c.approvalRate);
+  const mean = rates.reduce((s, v) => s + v, 0) / rates.length;
+  const sd = stdDev(rates);
+
   for (const c of byCountry) {
-    const diff = globalApprovalRate - c.approvalRate;
-    if (diff > 8 && c.total > 100) {
+    const z = zScore(c.approvalRate, mean, sd);
+    // Flag countries below -1.5σ
+    if (z < -1.5 && c.total > 100) {
+      const diff = globalApprovalRate - c.approvalRate;
       insights.push({
         id: nextId(),
         type: 'geographic_outlier',
-        severity: diff > 15 ? 'critical' : 'warning',
-        title: `${c.value} has ${c.approvalRate.toFixed(1)}% approval rate (${diff.toFixed(1)}% below average)`,
-        description: `${c.value} processes ${c.total} transactions but only approves ${c.approvalRate.toFixed(1)}%. Lost revenue: $${Math.round(c.lostRevenue).toLocaleString()}.`,
+        severity: z < -2 ? 'critical' : 'warning',
+        title: `${c.value} has ${c.approvalRate.toFixed(1)}% approval rate (z=${z.toFixed(2)}, ${diff.toFixed(1)}% below avg)`,
+        description: `${c.value} processes ${c.total} transactions but only approves ${c.approvalRate.toFixed(1)}% (z-score: ${z.toFixed(2)}, below -1.5σ). Lost revenue: $${Math.round(c.lostRevenue).toLocaleString()}.`,
         impact: c.lostRevenue,
         recommendation: `Investigate ${c.value}-specific decline patterns. Consider local processor optimization or alternative payment methods popular in ${c.value}.`,
       });
@@ -159,21 +199,28 @@ export function detectRecoverableRevenue(transactions: Transaction[]): Insight[]
 
 export function detectTemporalAnomalies(transactions: Transaction[]): Insight[] {
   const hourly = getHourlyPattern(transactions);
-  const avgRate = hourly.reduce((s, h) => s + h.approvalRate, 0) / hourly.length;
+  const rates = hourly.map(h => h.approvalRate);
+  const mean = rates.reduce((s, v) => s + v, 0) / rates.length;
+  const sd = stdDev(rates);
   const insights: Insight[] = [];
 
-  const peakHours = hourly.filter(h => h.approvalRate < avgRate - 5 && h.total > 50);
+  // Flag hours below -2σ (statistically anomalous using 2-sigma rule)
+  const anomalousHours = hourly.filter(h => {
+    const z = zScore(h.approvalRate, mean, sd);
+    return z < -2 && h.total > 50;
+  });
 
-  if (peakHours.length > 0) {
-    const worstHour = peakHours.sort((a, b) => a.approvalRate - b.approvalRate)[0];
-    const hourRange = peakHours.map(h => `${h.hour}:00`).join(', ');
+  if (anomalousHours.length > 0) {
+    const worstHour = anomalousHours.sort((a, b) => a.approvalRate - b.approvalRate)[0];
+    const worstZ = zScore(worstHour.approvalRate, mean, sd);
+    const hourRange = anomalousHours.map(h => `${h.hour}:00`).join(', ');
 
     insights.push({
       id: nextId(),
       type: 'temporal_anomaly',
-      severity: 'info',
-      title: `Lower approval rates during peak hours (${hourRange})`,
-      description: `Approval rates drop to ${worstHour.approvalRate.toFixed(1)}% at ${worstHour.hour}:00 UTC compared to the daily average of ${avgRate.toFixed(1)}%. This suggests increased transaction volume overwhelming processor capacity or higher fraud rates.`,
+      severity: worstZ < -3 ? 'warning' : 'info',
+      title: `Anomalous approval rates at hours ${hourRange} (below -2σ)`,
+      description: `Approval rates drop to ${worstHour.approvalRate.toFixed(1)}% at ${worstHour.hour}:00 UTC (z-score: ${worstZ.toFixed(2)}) compared to the mean of ${mean.toFixed(1)}% (σ=${sd.toFixed(2)}). Values beyond 2 standard deviations indicate statistically significant deviation.`,
       impact: 0,
       recommendation: `Consider implementing time-based routing to distribute load across processors during peak hours. Review velocity limit configurations.`,
     });
@@ -197,10 +244,10 @@ export function detectAllInsights(transactions: Transaction[]): Insight[] {
   ];
 
   // Sort by severity then impact
-  const severityOrder = { critical: 0, warning: 1, info: 2 };
+  const severityOrder: Record<string, number> = { critical: 0, warning: 1, info: 2 };
   insights.sort((a, b) => {
-    const sd = severityOrder[a.severity] - severityOrder[b.severity];
-    if (sd !== 0) return sd;
+    const svd = severityOrder[a.severity] - severityOrder[b.severity];
+    if (svd !== 0) return svd;
     return b.impact - a.impact;
   });
 

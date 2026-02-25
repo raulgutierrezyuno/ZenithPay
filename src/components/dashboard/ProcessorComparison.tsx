@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo } from 'react';
 import { DimensionMetric } from '@/lib/data/schema';
 
 interface ProcessorComparisonProps {
@@ -20,10 +21,15 @@ const PROCESSOR_COLORS: Record<string, string> = {
 };
 
 export default function ProcessorComparison({ data }: ProcessorComparisonProps) {
-  const sorted = [...data].sort((a, b) => b.approvalRate - a.approvalRate);
-  const avgRate = data.reduce((s, d) => s + d.approvalRate * d.total, 0) / data.reduce((s, d) => s + d.total, 0);
-  const best = sorted[0];
-  const worst = sorted[sorted.length - 1];
+  const { sorted, avgRate, best, worst } = useMemo(() => {
+    const sorted = [...data].sort((a, b) => b.approvalRate - a.approvalRate);
+    const totalWeighted = data.reduce((s, d) => s + d.approvalRate * d.total, 0);
+    const totalTxns = data.reduce((s, d) => s + d.total, 0);
+    const avgRate = totalTxns > 0 ? totalWeighted / totalTxns : 0;
+    const best = sorted[0];
+    const worst = sorted[sorted.length - 1];
+    return { sorted, avgRate, best, worst };
+  }, [data]);
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
