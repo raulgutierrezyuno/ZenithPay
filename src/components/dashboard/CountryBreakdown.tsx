@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo } from 'react';
 import { DimensionMetric } from '@/lib/data/schema';
 
 interface CountryBreakdownProps {
@@ -20,8 +21,11 @@ function formatCurrency(value: number): string {
 }
 
 export default function CountryBreakdown({ data }: CountryBreakdownProps) {
-  const sorted = [...data].sort((a, b) => b.total - a.total);
-  const totalTxns = data.reduce((s, d) => s + d.total, 0);
+  const { sorted, totalTxns } = useMemo(() => {
+    const sorted = [...data].sort((a, b) => b.total - a.total);
+    const totalTxns = data.reduce((s, d) => s + d.total, 0);
+    return { sorted, totalTxns };
+  }, [data]);
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
