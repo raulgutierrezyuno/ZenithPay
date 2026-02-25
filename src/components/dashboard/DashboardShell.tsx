@@ -1,7 +1,12 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import { Filters, MetricsResponse, Insight, Recommendation, Transaction } from '@/lib/data/schema';
+import { useState, useMemo } from 'react';
+import { Filters, Transaction } from '@/lib/data/schema';
+import { generateTransactions } from '@/lib/data/generator';
+import { filterTransactions } from '@/lib/data/store';
+import { computeAllMetrics } from '@/lib/analysis/metrics';
+import { detectAllInsights } from '@/lib/analysis/anomaly';
+import { generateRecommendations } from '@/lib/analysis/recommendations';
 import KPICards from './KPICards';
 import FilterBar from './FilterBar';
 import ApprovalTrend from './ApprovalTrend';
@@ -16,15 +21,13 @@ import RecommendationsPanel from './RecommendationsPanel';
 import CohortAnalysis from './CohortAnalysis';
 import TransactionTable from './TransactionTable';
 
-function buildQuery(filters: Filters): string {
-  const params = new URLSearchParams();
-  if (filters.country && filters.country !== 'all') params.set('country', filters.country);
-  if (filters.paymentMethod && filters.paymentMethod !== 'all') params.set('paymentMethod', filters.paymentMethod);
-  if (filters.processor && filters.processor !== 'all') params.set('processor', filters.processor);
-  if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
-  if (filters.dateTo) params.set('dateTo', filters.dateTo);
-  if (filters.status && filters.status !== 'all') params.set('status', filters.status);
-  return params.toString();
+// Generate transactions once on module load (deterministic with seed)
+let _allTransactions: Transaction[] | null = null;
+function getAllTransactions(): Transaction[] {
+  if (!_allTransactions) {
+    _allTransactions = generateTransactions(5500, 42);
+  }
+  return _allTransactions;
 }
 
 export default function DashboardShell() {
@@ -34,61 +37,38 @@ export default function DashboardShell() {
     processor: 'all',
   });
 
-  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
-  const [insights, setInsights] = useState<Insight[]>([]);
-  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [txnMeta, setTxnMeta] = useState({ total: 0, page: 1, totalPages: 1 });
-  const [loading, setLoading] = useState(true);
+  const [txnPage, setTxnPage] = useState(1);
   const [activeTab, setActiveTab] = useState<'overview' | 'insights' | 'transactions'>('overview');
 
-  const fetchData = useCallback(async (currentFilters: Filters, page: number = 1) => {
-    setLoading(true);
-    const query = buildQuery(currentFilters);
+  const allTransactions = useMemo(() => getAllTransactions(), []);
 
-    try {
-      const [metricsRes, insightsRes, txnRes] = await Promise.all([
-        fetch(`/api/metrics?${query}`),
-        fetch(`/api/insights?${query}`),
-        fetch(`/api/transactions?${query}&page=${page}&limit=20`),
-      ]);
+  const filtered = useMemo(
+    () => filterTransactions(allTransactions, filters),
+    [allTransactions, filters]
+  );
 
-      const metricsData = await metricsRes.json();
-      const insightsData = await insightsRes.json();
-      const txnData = await txnRes.json();
+  const metrics = useMemo(() => computeAllMetrics(filtered), [filtered]);
+  const insights = useMemo(() => detectAllInsights(filtered), [filtered]);
+  const recommendations = useMemo(() => generateRecommendations(filtered), [filtered]);
 
-      setMetrics(metricsData);
-      setInsights(insightsData.insights);
-      setRecommendations(insightsData.recommendations);
-      setTransactions(txnData.data);
-      setTxnMeta({ total: txnData.total, page: txnData.page, totalPages: txnData.totalPages });
-    } catch (error) {
-      console.error('Failed to fetch data:', error);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchData(filters);
-  }, [filters, fetchData]);
+  const txnLimit = 20;
+  const txnMeta = useMemo(() => {
+    const total = filtered.length;
+    const totalPages = Math.ceil(total / txnLimit);
+    const start = (txnPage - 1) * txnLimit;
+    const paginated = filtered.slice(start, start + txnLimit);
+    return { data: paginated, total, page: txnPage, totalPages };
+  }, [filtered, txnPage]);
 
   const handlePageChange = (page: number) => {
-    fetchData(filters, page);
+    setTxnPage(page);
   };
 
-  if (loading && !metrics) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-center">
-          <div className="w-12 h-12 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-gray-500">Loading transaction data...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!metrics) return null;
+  // Reset pagination when filters change
+  const handleFilterChange = (newFilters: Filters) => {
+    setFilters(newFilters);
+    setTxnPage(1);
+  };
 
   return (
     <div className="max-w-[1400px] mx-auto px-4 py-6">
@@ -102,7 +82,7 @@ export default function DashboardShell() {
 
       {/* Filters */}
       <div className="mb-6">
-        <FilterBar filters={filters} onFilterChange={setFilters} />
+        <FilterBar filters={filters} onFilterChange={handleFilterChange} />
       </div>
 
       {/* KPIs */}
@@ -176,7 +156,7 @@ export default function DashboardShell() {
 
       {activeTab === 'transactions' && (
         <TransactionTable
-          transactions={transactions}
+          transactions={txnMeta.data}
           total={txnMeta.total}
           page={txnMeta.page}
           totalPages={txnMeta.totalPages}
